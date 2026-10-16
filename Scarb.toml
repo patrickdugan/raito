@@ -11,9 +11,10 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 cairo_test = "2.19.6"
-# Shinigami fork checked against Bitcoin Core's script vectors, with syscall-free secp256k1
-# (upstream 1963116 verifies signatures through Starknet secp256k1 syscalls, which a
-# bootloader/stwo proof does not constrain).
+# Shinigami fork checked against Bitcoin Core's script vectors, with syscall-free secp256k1.
+# Upstream 1963116 verifies signatures through Starknet secp256k1 syscalls; the client
+# built with it declares no `system` builtin, so the bootloader's SHA-256-only syscall
+# check (verify_sha256) never sees them, and a stwo proof does not constrain their results.
 shinigami_engine = { git = "https://github.com/patrickdugan/shinigami.git", rev = "19cb9fab4664e8f7fc4936f018d9c59ccac5883c" }
 
 [profile.proving]
