@@ -1,0 +1,19 @@
+[package]
+name = "chain_segment"
+version = "0.1.0"
+edition = "2024_07"
+
+# No `allow-syscalls`: the build fails if any syscall (e.g. SHA-256 via
+# `sha256_process_block`) is compiled in. A proof cannot constrain a syscall's result.
+[executable]
+
+[dependencies]
+cairo_execute = "2.11.4"
+consensus = { path = "../consensus" }
+utils = { path = "../utils" }
+
+[dev-dependencies]
+cairo_test.workspace = true
+
+[scripts]
+lint = "scarb fmt"

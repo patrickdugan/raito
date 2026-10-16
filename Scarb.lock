@@ -16,6 +16,14 @@ version = "0.1.0"
 source = "git+https://github.com/starkware-libs/stwo-cairo?rev=e8bc9571675bb654b6e26a7bd53838a6ae78c344#e8bc9571675bb654b6e26a7bd53838a6ae78c344"
 
 [[package]]
+name = "chain_segment"
+version = "0.1.0"
+dependencies = [
+ "consensus",
+ "utils",
+]
+
+[[package]]
 name = "client"
 version = "0.1.0"
 dependencies = [
