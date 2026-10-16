@@ -4,7 +4,7 @@ use shinigami_engine::engine::{EngineImpl, EngineTrait};
 use shinigami_engine::flags::ScriptFlags;
 use shinigami_engine::hash_cache::HashCacheImpl;
 use shinigami_engine::transaction::{
-    EngineTransactionInputTrait, EngineTransactionOutputTrait, EngineTransactionTrait,
+    EngineTransactionInputTrait, EngineTransactionOutputTrait, EngineTransactionTrait, UTXO,
 };
 use crate::types::block::Header;
 use crate::types::transaction::{Transaction, TxIn, TxOut};
@@ -85,12 +85,56 @@ impl EngineTransactionDummyImpl of EngineTransactionTrait<Transaction, TxIn, TxO
     fn get_locktime(self: @Transaction) -> u32 {
         *self.lock_time
     }
+
+    /// The engine only stores the txid on its transaction copy; no signature message or
+    /// script check reads it, so it is not recomputed here.
+    fn get_txid(self: @Transaction) -> u256 {
+        0
+    }
+
+    /// Spent outputs in input order, as BIP-341 signature messages require.
+    fn get_transaction_utxos(self: @Transaction) -> Array<UTXO> {
+        let mut utxos = array![];
+        for input in *self.inputs {
+            utxos.append(prevout_utxo(input));
+        }
+        utxos
+    }
+
+    fn get_input_utxo(self: @Transaction, input_index: u32) -> UTXO {
+        prevout_utxo((*self.inputs).at(input_index))
+    }
 }
 
-/// Computes the script flags for a given transaction.
-fn script_flags(header: @Header, tx: @Transaction) -> u32 {
+/// The engine requires `Default` on the transaction type; an empty transaction serves.
+impl TransactionDefault of Default<Transaction> {
+    fn default() -> Transaction {
+        Transaction {
+            version: 0,
+            is_segwit: false,
+            inputs: array![].span(),
+            outputs: array![].span(),
+            lock_time: 0,
+        }
+    }
+}
+
+fn prevout_utxo(input: @TxIn) -> UTXO {
+    let prev = input.previous_output;
+    UTXO {
+        amount: Into::<u64, i128>::into(*prev.data.value).try_into().unwrap(),
+        pubkey_script: (*prev.data.pk_script).clone(),
+        block_height: *prev.block_height,
+    }
+}
+
+/// Computes the script flags for a transaction in the block at `block_height`.
+///
+/// Soft-fork rules apply by the height of the block being validated, not by the height at
+/// which the spent outputs were created (upstream used `inputs[0].previous_output`, which
+/// skipped e.g. P2SH evaluation for pre-BIP16 outputs spent after activation).
+fn script_flags(header: @Header, block_height: @u32) -> u32 {
     let mut script_flags = 0_u32;
-    let block_height = tx.inputs[0].previous_output.block_height;
 
     // Blocks created after the BIP0016 activation time need to have the
     // pay-to-script-hash checks enabled.
@@ -146,8 +190,11 @@ fn parse_short_string(short: felt252) -> ByteArray {
 }
 
 /// Validates script for a given input.
-fn validate_script(header: @Header, tx: @Transaction, tx_idx: u32) -> Result<(), ByteArray> {
+fn validate_script(
+    header: @Header, tx: @Transaction, tx_idx: u32, block_height: u32,
+) -> Result<(), ByteArray> {
     let cache = HashCacheImpl::new(tx);
+    let flags = script_flags(header, @block_height);
     let mut result: Option<ByteArray> = Option::None;
     for input_idx in 0..(*tx.inputs).len() {
         let previous_output = *tx.inputs[input_idx].previous_output;
@@ -155,14 +202,16 @@ fn validate_script(header: @Header, tx: @Transaction, tx_idx: u32) -> Result<(),
             previous_output.data.pk_script,
             tx,
             input_idx,
-            script_flags(header, tx),
+            flags,
             Into::<u64, i128>::into(previous_output.data.value).try_into().unwrap(),
             @cache,
         )
             .unwrap(); //TODO: handle error
 
         match engine.execute() {
-            Result::Ok(_) => { break; }, // TODO: verify this is correct
+            // Every input must pass; upstream stopped at the first passing input, so
+            // inputs after it were never checked.
+            Result::Ok(_) => {},
             Result::Err(err) => {
                 result =
                     Option::Some(
@@ -185,11 +234,13 @@ fn validate_script(header: @Header, tx: @Transaction, tx_idx: u32) -> Result<(),
 }
 
 /// Validates scripts for one or multiple transactions.
-pub fn validate_scripts(header: @Header, txs: Span<Transaction>) -> Result<(), ByteArray> {
+pub fn validate_scripts(
+    header: @Header, txs: Span<Transaction>, block_height: u32,
+) -> Result<(), ByteArray> {
     let mut r = Result::Ok(());
     let mut i = 1;
     for tx in txs {
-        r = validate_script(header, tx, i);
+        r = validate_script(header, tx, i, block_height);
         if r.is_err() {
             break;
         }

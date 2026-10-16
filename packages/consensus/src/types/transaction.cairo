@@ -133,7 +133,10 @@ pub struct TxOut {
 impl TxOutHash<S, +HashStateTrait<S>, +Drop<S>> of Hash<TxOut, S> {
     fn update_state(state: S, value: TxOut) -> S {
         let state = state.update(value.value.into());
-        let state = state.update_with(value.pk_script.into());
+        // Hash the snapshot directly: with newer corelib `.into()` here is ambiguous
+        // between `@ByteArray` and `ByteArray`.
+        let pk_script: @ByteArray = value.pk_script;
+        let state = state.update_with(pk_script);
         state
     }
 }

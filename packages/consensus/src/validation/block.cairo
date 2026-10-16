@@ -40,7 +40,7 @@ pub fn validate_block(
             )?;
 
             validate_coinbase(txs[0], total_fees, block_height, wtxid_root)?;
-            validate_scripts(@block.header, txs.slice(1, txs.len() - 1))?;
+            validate_scripts(@block.header, txs.slice(1, txs.len() - 1), block_height)?;
             txid_root
         },
     };

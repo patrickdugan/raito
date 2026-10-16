@@ -21,7 +21,9 @@ pub mod validation {
         use crate::types::block::Header;
         use crate::types::transaction::Transaction;
 
-        pub fn validate_scripts(header: @Header, txs: Span<Transaction>) -> Result<(), ByteArray> {
+        pub fn validate_scripts(
+            header: @Header, txs: Span<Transaction>, block_height: u32,
+        ) -> Result<(), ByteArray> {
             Result::Ok(())
         }
     }

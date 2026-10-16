@@ -3,15 +3,18 @@ members = ["packages/*"]
 
 [workspace.package]
 description = "Bitcoin ZK client."
-cairo-version = "2.12.2"
+cairo-version = "2.19.6"
 version = "0.1.0"
 readme = "README.md"
 repository = "https://github.com/keep-starknet-strange/raito"
 license-file = "LICENSE"
 
 [workspace.dependencies]
-cairo_test = "2.12.2"
-shinigami_engine = { git = "https://github.com/keep-starknet-strange/shinigami.git", rev = "1963116" }
+cairo_test = "2.19.6"
+# Shinigami fork checked against Bitcoin Core's script vectors, with syscall-free secp256k1
+# (upstream 1963116 verifies signatures through Starknet secp256k1 syscalls, which a
+# bootloader/stwo proof does not constrain).
+shinigami_engine = { git = "https://github.com/patrickdugan/shinigami.git", rev = "19cb9fab4664e8f7fc4936f018d9c59ccac5883c" }
 
 [profile.proving]
 inherits = "release"
