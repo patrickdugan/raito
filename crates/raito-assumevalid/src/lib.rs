@@ -5,9 +5,12 @@
 //! 2. Prove assumevalid arguments using Cairo programs and STARK proofs
 
 pub mod adapters;
+pub mod checkpoint;
 pub mod gcs;
 pub mod generate_args;
+pub mod lowmem_adapter;
 pub mod prove;
+pub mod staged;
 
 pub use prove::{prove, ProveParams};
 

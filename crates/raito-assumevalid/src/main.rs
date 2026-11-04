@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long, default_value = "1")]
         total_blocks: u32,
 
+        /// Absolute target height for idempotent crash recovery
+        #[arg(long)]
+        target_height: Option<u32>,
+
         /// Step size for each batch
         #[arg(long, default_value = "1")]
         step_size: u32,
@@ -59,9 +63,55 @@ enum Commands {
         #[arg(long)]
         prover_params_file: Option<PathBuf>,
 
+        /// Optional JSON verifier config with pinned bootloader and task hashes
+        #[arg(long)]
+        verifier_config_file: Option<PathBuf>,
+
+        /// Run VM/adaptation and STWO proving in separate disk-spilling processes
+        #[arg(long)]
+        disk_staged: bool,
+
+        /// Stream memory and trace relocation through the pinned adapter APIs
+        #[arg(long)]
+        lowmem_adapter: bool,
+
+        /// Rayon worker threads for each disk-staged process
+        #[arg(long)]
+        worker_threads: Option<usize>,
+
         /// Don't delete temporary files after completion
         #[arg(long, default_value = "false")]
         keep_temp_files: bool,
+    },
+    /// Internal worker entrypoint; use the public 'prove --disk-staged' command.
+    #[command(hide = true)]
+    InternalAdapt {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        arguments_file: PathBuf,
+        #[arg(long)]
+        prover_input_file: PathBuf,
+        #[arg(long)]
+        lowmem_adapter: bool,
+    },
+    /// Diagnostic: compare standard and low-memory adapters for a small fixture.
+    #[command(hide = true)]
+    AdapterParity {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        arguments_file: PathBuf,
+    },
+    /// Internal worker entrypoint; use the public 'prove --disk-staged' command.
+    #[command(hide = true)]
+    InternalProve {
+        #[arg(long)]
+        prover_input_file: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        prover_params_file: Option<PathBuf>,
     },
 }
 
@@ -107,9 +157,14 @@ async fn main() -> Result<()> {
             save_to_gcs,
             gcs_bucket,
             total_blocks,
+            target_height,
             step_size,
             output_dir,
             prover_params_file,
+            verifier_config_file,
+            disk_staged,
+            lowmem_adapter,
+            worker_threads,
             keep_temp_files,
         } => {
             let params = ProveParams {
@@ -119,13 +174,51 @@ async fn main() -> Result<()> {
                 gcs_bucket,
                 bridge_url: cli.bridge_url,
                 total_blocks,
+                target_height,
                 step_size,
                 output_dir,
                 prover_params_file,
+                verifier_config_file,
+                disk_staged,
+                lowmem_adapter,
+                worker_threads,
                 keep_temp_files,
             };
 
             prove(params).await?;
+        }
+        Commands::InternalAdapt {
+            executable,
+            arguments_file,
+            prover_input_file,
+            lowmem_adapter,
+        } => {
+            raito_assumevalid::staged::run_adapter_worker(
+                &executable,
+                &arguments_file,
+                &prover_input_file,
+                lowmem_adapter,
+            )?;
+        }
+        Commands::AdapterParity {
+            executable,
+            arguments_file,
+        } => {
+            raito_assumevalid::lowmem_adapter::verify_adapter_parity(
+                &executable,
+                &arguments_file,
+            )?;
+        }
+        Commands::InternalProve {
+            prover_input_file,
+            output_dir,
+            prover_params_file,
+        } => {
+            raito_assumevalid::staged::run_prover_worker(
+                &prover_input_file,
+                &output_dir,
+                prover_params_file.as_deref(),
+            )?;
         }
     }
 

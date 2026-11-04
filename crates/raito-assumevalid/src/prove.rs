@@ -3,6 +3,12 @@
 //! This module provides functionality to run Cairo programs and generate STARK proofs
 //! using the stwo-cairo prover library directly.
 
+use crate::checkpoint;
+use crate::gcs::{download_recent_proof_via_reqwest, upload_recent_proof, RecentProof};
+use crate::generate_args::{generate_and_save_args, AssumeValidParams, ProveClient, ProveConfig};
+use crate::lowmem_adapter;
+use crate::staged;
+use crate::BOOTLOADER_STR;
 use anyhow::{anyhow, Result};
 use cairo_air::utils::{deserialize_proof_from_file, serialize_proof_to_file, ProofFormat};
 use cairo_program_runner_lib::cairo_run_program;
@@ -10,15 +16,15 @@ use cairo_program_runner_lib::utils::get_cairo_run_config;
 use cairo_vm::types::layout_name::LayoutName;
 use cairo_vm::types::program::Program;
 use memory_stats::memory_stats;
-use regex::Regex;
+use raito_spv_verify::{verify_chain_state, VerifierConfig};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stwo::core::vcs::blake2_merkle::Blake2sMerkleHasher;
-use stwo_cairo_adapter::adapter::adapt;
+use stwo_cairo_adapter::{adapter::adapt, ProverInput};
 use stwo_cairo_prover::prover::create_and_serialize_proof;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Get current memory usage in MB
 fn get_memory_mb() -> f64 {
@@ -27,31 +33,21 @@ fn get_memory_mb() -> f64 {
         .unwrap_or(0.0)
 }
 
-use crate::gcs::{download_recent_proof_via_reqwest, upload_recent_proof, RecentProof};
-use crate::generate_args::{generate_and_save_args, AssumeValidParams, ProveClient, ProveConfig};
-use crate::BOOTLOADER_STR;
+/// Linux process high-water RSS, including short-lived proving allocations.
+pub(crate) fn get_peak_memory_mb() -> Option<f64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+    Some(kib / 1024.0)
+}
 
-/// Runs the Cairo program through the bootloader and generates a STARK proof.
-///
-/// This function:
-/// 1. Loads the bootloader program from embedded resources
-/// 2. Generates the program input JSON for the bootloader
-/// 3. Runs the Cairo VM
-/// 4. Adapts the VM output for the prover
-/// 5. Generates and serializes the STARK proof
-pub fn run_and_prove_with_library(
+/// Execute the Cairo VM and adapt its trace into an owned STWO prover input.
+/// The VM runner is released before this function returns.
+pub fn run_and_adapt_with_library(
     executable: &Path,
     arguments_file: &Path,
-    output_dir: &Path,
-    prover_params: Option<&Path>,
-    verify: bool,
-) -> Result<PathBuf> {
-    let start_time = Instant::now();
-    let start_mem = get_memory_mb();
-
-    // Create output directory
-    fs::create_dir_all(output_dir)?;
-
+    lowmem_adapter: bool,
+) -> Result<ProverInput> {
     // Resolve paths to absolute with helpful error messages
     let executable_abs = executable.canonicalize().map_err(|e| {
         anyhow!(
@@ -116,7 +112,15 @@ pub fn run_and_prove_with_library(
     // Adapt the VM output for the prover
     debug!("Adapting VM output for prover...");
     let adapt_start = Instant::now();
-    let prover_input = adapt(&runner).map_err(|e| anyhow!("Failed to adapt VM output: {}", e))?;
+    let prover_input = if lowmem_adapter {
+        lowmem_adapter::adapt_low_memory(&runner)
+            .map_err(|e| anyhow!("Low-memory adaptation failed: {}", e))?
+    } else {
+        adapt(&runner).map_err(|e| anyhow!("Failed to adapt VM output: {}", e))?
+    };
+    // adapt returns an owned ProverInput. Free the VM trace and memory before
+    // STWO allocates its witness and commitment buffers.
+    drop(runner);
     let adapt_elapsed = adapt_start.elapsed();
     let adapt_mem = get_memory_mb();
     info!(
@@ -124,6 +128,53 @@ pub fn run_and_prove_with_library(
         adapt_elapsed.as_secs_f64(),
         adapt_mem
     );
+
+    Ok(prover_input)
+}
+
+/// Runs the Cairo program through the bootloader and generates a STARK proof.
+///
+/// This function:
+/// 1. Loads the bootloader program from embedded resources
+/// 2. Generates the program input JSON for the bootloader
+/// 3. Runs the Cairo VM
+/// 4. Adapts the VM output for the prover
+/// 5. Generates and serializes the STARK proof
+pub fn run_and_prove_with_library(
+    executable: &Path,
+    arguments_file: &Path,
+    output_dir: &Path,
+    prover_params: Option<&Path>,
+    verify: bool,
+) -> Result<PathBuf> {
+    run_and_prove_with_adapter(
+        executable,
+        arguments_file,
+        output_dir,
+        prover_params,
+        verify,
+        false,
+    )
+}
+
+/// Run a complete proof with a selectable adapter. The legacy wrapper above
+/// retains the existing library signature for downstream callers.
+pub fn run_and_prove_with_adapter(
+    executable: &Path,
+    arguments_file: &Path,
+    output_dir: &Path,
+    prover_params: Option<&Path>,
+    verify: bool,
+    lowmem_adapter: bool,
+) -> Result<PathBuf> {
+    let start_time = Instant::now();
+    let start_mem = get_memory_mb();
+
+    // Create output directory
+    fs::create_dir_all(output_dir)?;
+
+    // The direct route uses the same adapter as the disk-staged worker.
+    let prover_input = run_and_adapt_with_library(executable, arguments_file, lowmem_adapter)?;
 
     // Generate the proof
     let proof_file = output_dir.join("proof.json");
@@ -146,9 +197,9 @@ pub fn run_and_prove_with_library(
     );
 
     let total_elapsed = start_time.elapsed();
-    let peak_mem = prove_mem.max(adapt_mem).max(vm_mem);
+    let peak_mem = get_peak_memory_mb().unwrap_or(prove_mem);
     info!(
-        "Total: {:.2}s, peak memory: {:.1} MB (started at {:.1} MB)",
+        "Total: {:.2}s, process high-water RSS: {:.1} MB (started at {:.1} MB)",
         total_elapsed.as_secs_f64(),
         peak_mem,
         start_mem
@@ -157,222 +208,223 @@ pub fn run_and_prove_with_library(
     Ok(proof_file)
 }
 
-/// Parameters for proving multiple batches iteratively
+/// Parameters for proving bounded-size batches iteratively.
 #[derive(Debug, Clone)]
 pub struct ProveParams {
-    /// Path to the Cairo1 executable JSON file
     pub executable: PathBuf,
     pub load_from_gcs: bool,
     pub save_to_gcs: bool,
-    /// GCS bucket name for loading/saving proofs
     pub gcs_bucket: String,
     pub bridge_url: String,
-    /// Total number of blocks to process
+    /// Additional blocks beyond the last verified checkpoint.
     pub total_blocks: u32,
-    /// Step size for each batch
+    /// Optional absolute height, allowing idempotent resume after a crash.
+    pub target_height: Option<u32>,
+    /// Maximum number of headers in each recursive STARK proof.
     pub step_size: u32,
-    /// Output directory for all proofs
     pub output_dir: PathBuf,
-    /// Path to the prover parameters JSON file (optional)
     pub prover_params_file: Option<PathBuf>,
-    /// Whether to keep temporary files after completion
+    pub verifier_config_file: Option<PathBuf>,
+    pub disk_staged: bool,
+    pub lowmem_adapter: bool,
+    pub worker_threads: Option<usize>,
     pub keep_temp_files: bool,
 }
 
-/// Find the previous proof file for a given start height
-pub fn find_proof_file(start_height: u32, output_dir: &Path) -> Option<PathBuf> {
-    if start_height == 0 {
-        return None;
-    }
-
-    if let Ok(entries) = fs::read_dir(output_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(dir_name) = entry.file_name().to_str() {
-                    if dir_name.ends_with(&format!("_to_{}", start_height)) {
-                        let proof_file = entry.path().join("proof.json");
-                        if proof_file.exists() {
-                            return Some(proof_file);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Auto-detect the starting height by finding the highest ending height from existing proof directories
-pub fn auto_detect_start_height(proof_dir: &Path) -> u32 {
-    let mut max_height = 0;
-    let pattern = Regex::new(r"batch_(\d+)_to_(\d+)").unwrap();
-
-    if !proof_dir.exists() {
-        return max_height;
-    }
-
-    if let Ok(entries) = fs::read_dir(proof_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(dir_name) = entry.file_name().to_str() {
-                    if let Some(captures) = pattern.captures(dir_name) {
-                        if let (Ok(_start), Ok(end)) =
-                            (captures[1].parse::<u32>(), captures[2].parse::<u32>())
-                        {
-                            let proof_file = entry.path().join("proof.json");
-                            if proof_file.exists() && end > max_height {
-                                max_height = end;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    max_height
-}
-
-pub async fn create_batch_dir(
-    start_height: u32,
-    step_size: u32,
-    output_dir: &Path,
-) -> Result<PathBuf> {
-    let batch_name = format!("batch_{}_to_{}", start_height, start_height + step_size);
-    let batch_dir = output_dir.join(&batch_name);
-    tokio::fs::create_dir_all(&batch_dir).await?;
-    Ok(batch_dir)
-}
-
-/// Main function to prove multiple batches iteratively
+/// Extend a verified recursive STARK checkpoint using independently verified batches.
 pub async fn prove(params: ProveParams) -> Result<()> {
-    if params.load_from_gcs {
-        let recent_proof = download_recent_proof_via_reqwest(params.gcs_bucket.as_str()).await?;
-        let batch_dir =
-            create_batch_dir(0, recent_proof.chainstate.block_height, &params.output_dir).await?;
+    if params.step_size == 0 {
+        return Err(anyhow!("step_size must be at least 1"));
+    }
+    if params.worker_threads == Some(0) {
+        return Err(anyhow!("worker_threads must be positive"));
+    }
+    if !params.disk_staged && params.worker_threads.is_some() {
+        return Err(anyhow!("worker_threads requires --disk-staged"));
+    }
+    fs::create_dir_all(&params.output_dir)?;
+    let verifier_config: VerifierConfig = match params.verifier_config_file.as_deref() {
+        Some(path) => serde_json::from_slice(&fs::read(path)?)?,
+        None => VerifierConfig::default(),
+    };
+    let client = ProveClient::new(ProveConfig {
+        bridge_node_url: params.bridge_url.clone(),
+    });
+    let genesis = client.get_chain_state(0).await?;
+    if genesis.block_height != 0 {
+        return Err(anyhow!("bridge genesis response has invalid height"));
+    }
+    let identity = checkpoint::CheckpointIdentity {
+        genesis_hash: genesis.best_block_hash.to_string(),
+        executable_hash: checkpoint::hash_file(&params.executable)?,
+        prover_params_hash: params
+            .prover_params_file
+            .as_deref()
+            .map(checkpoint::hash_file)
+            .transpose()?,
+        verifier_config_hash: checkpoint::hash_bytes(&serde_json::to_vec(&verifier_config)?),
+    };
+    let mut completed = checkpoint::recover(&params.output_dir, &identity)?;
 
-        // Save the recent proof to the output directory
-        let proof_file = batch_dir.join("proof.json");
+    // A remotely downloaded starting proof must pass the same verification gate.
+    if params.load_from_gcs && completed.is_empty() {
+        let recent = download_recent_proof_via_reqwest(&params.gcs_bucket).await?;
+        let height = recent.chainstate.block_height;
+        if height == 0 {
+            return Err(anyhow!("remote proof does not advance the chain"));
+        }
+        let expected = client.get_chain_state(height).await?;
+        if expected.block_height != height
+            || expected.blake2s_digest()? != recent.chainstate.blake2s_digest()?
+        {
+            return Err(anyhow!("GCS proof chain state disagrees with bridge"));
+        }
+        let dir = checkpoint::batch_dir(&params.output_dir, 0, height);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("proof.json");
         serialize_proof_to_file::<Blake2sMerkleHasher>(
-            &recent_proof.proof,
-            &proof_file,
+            &recent.proof,
+            &path,
             ProofFormat::CairoSerde,
         )?;
-
-        debug!(
-            "Using recent proof up to height: {}",
-            recent_proof.chainstate.block_height
-        );
+        let proof = deserialize_proof_from_file(&path, ProofFormat::CairoSerde)?;
+        verify_chain_state(&expected, proof, &verifier_config)?;
+        completed.push(checkpoint::seal(
+            &params.output_dir,
+            0,
+            height,
+            &identity,
+            None,
+            expected.blake2s_digest()?,
+        )?);
     }
 
-    let start_height = auto_detect_start_height(&params.output_dir);
+    // The final STARK proves the recursive history, while hashes detect local
+    // checkpoint corruption and prevent a different proof from being spliced in.
+    if let Some(tip) = completed.last() {
+        let state = client.get_chain_state(tip.end_height).await?;
+        if state.block_height != tip.end_height
+            || state.blake2s_digest()? != tip.chain_state_hash
+        {
+            return Err(anyhow!("recovered checkpoint chain state mismatch"));
+        }
+        let proof = deserialize_proof_from_file(
+            &checkpoint::proof_path(&params.output_dir, tip),
+            ProofFormat::CairoSerde,
+        )?;
+        verify_chain_state(&state, proof, &verifier_config)?;
+        info!("Verified recursive checkpoint through height {}", tip.end_height);
+    }
 
-    info!(
-        "Starting iterative proving process: start_height={}, total_blocks={}, step_size={}",
-        start_height, params.total_blocks, params.step_size
-    );
-    debug!("Output directory: {}", params.output_dir.display());
-
-    // Create output directory
-    tokio::fs::create_dir_all(&params.output_dir).await?;
-
-    let end_height = start_height + params.total_blocks;
+    let start_height = completed.last().map_or(0, |tip| tip.end_height);
+    let end_height = match params.target_height {
+        Some(target) if target < start_height => {
+            return Err(anyhow!("target height is behind the verified checkpoint"));
+        }
+        Some(target) => target,
+        None => start_height
+            .checked_add(params.total_blocks)
+            .ok_or_else(|| anyhow!("block range overflow"))?,
+    };
     let mut current_height = start_height;
     let mut last_proof_path: Option<PathBuf> = None;
     let mut last_height = start_height;
+    info!(
+        "Resumable STWO proving: start={}, end={}, max_batch_headers={}",
+        current_height, end_height, params.step_size
+    );
 
-    // Process batches sequentially
     while current_height < end_height {
-        let current_step = std::cmp::min(params.step_size, end_height - current_height);
-        if current_step == 0 {
-            break;
+        let current_step = params.step_size.min(end_height - current_height);
+        let next_height = current_height
+            .checked_add(current_step)
+            .ok_or_else(|| anyhow!("batch height overflow"))?;
+        let dir = checkpoint::batch_dir(&params.output_dir, current_height, next_height);
+        fs::create_dir_all(&dir)?;
+        let parent = completed.last().map(|batch| batch.proof_hash.clone());
+        let previous_proof = completed
+            .last()
+            .map(|batch| checkpoint::proof_path(&params.output_dir, batch));
+        if current_height != 0 && previous_proof.is_none() {
+            return Err(anyhow!("missing authenticated recursive predecessor"));
         }
 
-        let job_info = format!("Job(height='{}', blocks={})", current_height, current_step);
-        info!("{} proving...", job_info);
-
-        let batch_dir = create_batch_dir(current_height, current_step, &params.output_dir).await?;
-
-        // Look for previous proof
-        let chain_state_proof_path = find_proof_file(current_height, &params.output_dir);
-
-        // Generate arguments for this batch
-        debug!("{} generating args...", job_info);
-        let args_start_time = Instant::now();
-
-        let config = ProveConfig {
-            bridge_node_url: params.bridge_url.clone(),
-        };
-        let client = ProveClient::new(config);
-
-        let assumevalid_params = AssumeValidParams {
-            start_height: current_height,
-            block_count: current_step,
-            chain_state_proof_path,
-        };
-
-        let args_file = batch_dir.join("arguments.json");
-        generate_and_save_args(&client, assumevalid_params, &args_file.to_string_lossy()).await?;
-        let args_elapsed = args_start_time.elapsed();
+        let args_file = dir.join("arguments.json");
+        let args_started = Instant::now();
+        generate_and_save_args(
+            &client,
+            AssumeValidParams {
+                start_height: current_height,
+                block_count: current_step,
+                chain_state_proof_path: previous_proof,
+            },
+            &args_file.to_string_lossy(),
+        )
+        .await?;
         debug!(
-            "{} args generated in {:.2}s",
-            job_info,
-            args_elapsed.as_secs_f64()
+            "Generated arguments for [{}..{}] in {:.2}s",
+            current_height,
+            next_height,
+            args_started.elapsed().as_secs_f64()
         );
 
-        // Prove the batch using the library directly
-        let batch_result = run_and_prove_with_library(
-            &params.executable,
-            &args_file,
-            &batch_dir,
-            params.prover_params_file.as_deref(),
-            true, // verify
-        );
-
-        match batch_result {
-            Ok(proof_path) => {
-                info!("{} done", job_info);
-
-                // Store the last proof path and height for later upload
-                last_proof_path = Some(proof_path);
-                last_height = current_height + current_step;
-                current_height += current_step;
-
-                // Clean up temporary files if requested
-                if !params.keep_temp_files {
-                    if let Err(e) = std::fs::remove_file(&args_file) {
-                        warn!("Failed to remove args file: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Batch at height {} failed: {}", current_height, e);
-                info!("Stopping further processing due to batch failure");
-                return Err(e);
+        let proof_path = if params.disk_staged {
+            staged::run_in_worker_process(
+                &params.executable,
+                &args_file,
+                &dir,
+                params.prover_params_file.as_deref(),
+                params.keep_temp_files,
+                params.worker_threads,
+                params.lowmem_adapter,
+            )?
+        } else {
+            run_and_prove_with_adapter(
+                &params.executable,
+                &args_file,
+                &dir,
+                params.prover_params_file.as_deref(),
+                true,
+                params.lowmem_adapter,
+            )?
+        };
+        let state = client.get_chain_state(next_height).await?;
+        if state.block_height != next_height {
+            return Err(anyhow!("bridge returned the wrong post-batch height"));
+        }
+        let proof = deserialize_proof_from_file(&proof_path, ProofFormat::CairoSerde)?;
+        verify_chain_state(&state, proof, &verifier_config)?;
+        completed.push(checkpoint::seal(
+            &params.output_dir,
+            current_height,
+            next_height,
+            &identity,
+            parent,
+            state.blake2s_digest()?,
+        )?);
+        info!("Sealed verified checkpoint at height {}", next_height);
+        current_height = next_height;
+        last_height = next_height;
+        last_proof_path = Some(proof_path);
+        if !params.keep_temp_files {
+            if let Err(err) = fs::remove_file(&args_file) {
+                warn!("Could not remove args file: {}", err);
             }
         }
     }
 
-    // Upload only the last proof to GCS
     if params.save_to_gcs {
-        if let Some(proof_path) = last_proof_path {
-            info!("Uploading final proof to GCS for height {}", last_height);
-            let client = ProveClient::new(ProveConfig {
-                bridge_node_url: params.bridge_url.clone(),
-            });
-
-            let timestamp = format!("{}", chrono::Utc::now());
+        if let Some(path) = last_proof_path {
             let chainstate = client.get_chain_state(last_height).await?;
-            let proof = deserialize_proof_from_file(&proof_path, ProofFormat::CairoSerde)?;
-
-            let recent_proof = RecentProof {
-                timestamp,
+            let proof = deserialize_proof_from_file(&path, ProofFormat::CairoSerde)?;
+            let recent = RecentProof {
+                timestamp: chrono::Utc::now().to_string(),
                 chainstate,
                 proof,
             };
-            upload_recent_proof(&recent_proof, &params.gcs_bucket).await?;
-            info!("Successfully uploaded final proof to GCS");
+            upload_recent_proof(&recent, &params.gcs_bucket).await?;
+            info!("Uploaded verified checkpoint at height {} to GCS", last_height);
         }
     }
-
     Ok(())
 }
